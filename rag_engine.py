@@ -1,139 +1,123 @@
-"""
-rag_engine.py
---------------
-Core RAG logic: PDF parsing, chunking, vector storage (ChromaDB),
-semantic retrieval, and answer generation using Groq API with source citations.
-"""
-
-import chromadb
-from chromadb.api.types import EmbeddingFunction
-from pypdf import PdfReader
-import uuid
-import re
-import math
 import os
-from dotenv import load_dotenv  
+import chromadb
+from pypdf import PdfReader
 from groq import Groq
 
-# Load environment variables from .env file
-load_dotenv()
-
-
-class LightweightEmbeddingFunction(EmbeddingFunction):
-    """
-    A fast, no-download embedding function based on hashed word frequencies
-    (feature hashing). Avoids downloading large ML models over slow or
-    unstable internet connections. Good enough for small-to-medium document
-    Q&A demos and portfolio projects.
-    """
-
-    def __init__(self, dim=384):
-        self.dim = dim
-
-    def __call__(self, input):
-        return [self._embed(text) for text in input]
-
-    def _embed(self, text):
-        vec = [0.0] * self.dim
-        words = re.findall(r"\w+", text.lower())
-        for word in words:
-            idx = hash(word) % self.dim
-            vec[idx] += 1.0
-
-        norm = math.sqrt(sum(v * v for v in vec))
-        if norm > 0:
-            vec = [v / norm for v in vec]
-        return vec
-
-
 class RAGEngine:
-    def __init__(self, collection_name="documents"):
-        # Initialize Groq client (Reads GROQ_API_KEY from environment)
-        api_key = os.environ.get("GROQ_API_KEY")
-        self.client = Groq(api_key=api_key)
+    def __init__(self):
+        # Read API key from environment variable (set via Streamlit Secrets)
+        self.api_key = os.environ.get("GROQ_API_KEY")
+        if self.api_key:
+            self.groq_client = Groq(api_key=self.api_key)
+        else:
+            self.groq_client = None
         
-        self.chroma_client = chromadb.Client()  # in-memory vector store
-        self.embedding_fn = LightweightEmbeddingFunction()
-
-        # Reset collection each time a new session starts
-        try:
-            self.chroma_client.delete_collection(collection_name)
-        except Exception:
-            pass
-
-        self.collection = self.chroma_client.create_collection(
-            name=collection_name,
-            embedding_function=self.embedding_fn
+        # Initialize Ephemeral ChromaDB Client
+        self.chroma_client = chromadb.Client()
+        self.collection = self.chroma_client.get_or_create_collection(
+            name="pdf_documents"
         )
 
-    def extract_text_from_pdf(self, file):
-        reader = PdfReader(file)
-        pages_text = []
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text() or ""
-            pages_text.append((i + 1, text))
-        return pages_text
+    def index_document(self, file_obj, source_name="uploaded_pdf"):
+        """Extracts text from PDF, chunks it, and indexes into ChromaDB."""
+        try:
+            reader = PdfReader(file_obj)
+            documents = []
+            metadatas = []
+            ids = []
+            
+            chunk_id = 0
+            for page_num, page in enumerate(reader.pages, start=1):
+                text = page.extract_text()
+                if not text or not text.strip():
+                    continue
+                
+                paragraphs = text.split("\n\n")
+                for para in paragraphs:
+                    clean_para = para.strip()
+                    if len(clean_para) > 30:
+                        documents.append(clean_para)
+                        metadatas.append({
+                            "source": source_name,
+                            "page": page_num
+                        })
+                        ids.append(f"{source_name}_p{page_num}_c{chunk_id}")
+                        chunk_id += 1
 
-    def chunk_text(self, pages_text, chunk_size=600, overlap=100):
-        """Split each page's text into overlapping chunks, tagged with page number."""
-        chunks = []
-        for page_num, text in pages_text:
-            start = 0
-            while start < len(text):
-                chunk = text[start:start + chunk_size].strip()
-                if chunk:
-                    chunks.append({"text": chunk, "page": page_num})
-                start += chunk_size - overlap
-        return chunks
-
-    def index_document(self, file, source_name="uploaded_document"):
-        """Extract, chunk, and store a PDF's content as vector embeddings."""
-        pages_text = self.extract_text_from_pdf(file)
-        chunks = self.chunk_text(pages_text)
-
-        if not chunks:
+            if documents:
+                self.collection.add(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+            return len(documents)
+            
+        except Exception as e:
+            print(f"Error indexing document: {e}")
             return 0
 
-        ids = [str(uuid.uuid4()) for _ in chunks]
-        documents = [c["text"] for c in chunks]
-        metadatas = [{"page": c["page"], "source": source_name} for c in chunks]
-
-        self.collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        return len(chunks)
-
     def retrieve(self, question, top_k=4):
-        """Semantic search: find the most relevant chunks for a question."""
-        results = self.collection.query(query_texts=[question], n_results=top_k)
+        """Safely queries vector collection."""
+        try:
+            if self.collection.count() == 0:
+                return []
+                
+            results = self.collection.query(
+                query_texts=[question],
+                n_results=top_k
+            )
+            
+            retrieved_chunks = []
+            if results and 'documents' in results and results['documents']:
+                docs = results['documents'][0]
+                metas = results['metadatas'][0] if 'metadatas' in results else []
+                
+                for i in range(len(docs)):
+                    retrieved_chunks.append({
+                        "text": docs[i],
+                        "source": metas[i].get("source", "Unknown") if i < len(metas) else "Unknown",
+                        "page": metas[i].get("page", 1) if i < len(metas) else 1
+                    })
+            return retrieved_chunks
+            
+        except Exception as e:
+            print(f"ChromaDB Query Error: {e}")
+            return []
 
-        retrieved = []
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            retrieved.append({"text": doc, "page": meta["page"], "source": meta["source"]})
-        return retrieved
+    def generate_answer(self, question, context_chunks):
+        """Generates grounded answer using Groq Llama 3.1 model."""
+        if not context_chunks:
+            return "I couldn't find any relevant information in the uploaded documents to answer your question."
 
-    def generate_answer(self, question, retrieved_chunks):
-        """Answer using only retrieved context via Groq LLM (Llama 3.1 8B)."""
-        context_blocks = []
-        for i, chunk in enumerate(retrieved_chunks, 1):
-            context_blocks.append(f"[Source {i}, page {chunk['page']}]\n{chunk['text']}")
+        # Re-check API key in case it was updated dynamically
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            return "⚠️ Groq API Key is missing. Please add GROQ_API_KEY in Streamlit App Secrets."
 
-        context = "\n\n".join(context_blocks)
+        client = self.groq_client or Groq(api_key=api_key)
 
-        prompt = f"""Answer the question using ONLY the context below. Cite sources
-using the format [Source N] after each claim. If the answer isn't in the context,
-say you don't have enough information.
+        context_str = ""
+        for i, chunk in enumerate(context_chunks, start=1):
+            context_str += f"[Source {i} - {chunk['source']}, Page {chunk['page']}]:\n{chunk['text']}\n\n"
 
-CONTEXT:
-{context}
-
-QUESTION:
-{question}
-"""
-        # Updated to Groq Chat Completion standard
-        response = self.client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=700
+        system_prompt = (
+            "You are a helpful AI assistant. Answer the user's question accurately using ONLY "
+            "the provided document excerpts. If the information is not present in the excerpts, "
+            "state clearly that the document doesn't mention it."
         )
-        
-        return response.choices[0].message.content
+
+        user_prompt = f"Context excerpts:\n{context_str}\nQuestion: {question}"
+
+        try:
+            response = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=700
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"⚠️ Groq API Error: {str(e)}. Please verify your API Key in Streamlit Cloud Secrets."
