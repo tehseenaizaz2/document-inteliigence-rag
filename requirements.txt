@@ -1,0 +1,5 @@
+streamlit
+groq
+chromadb
+pypdf
+python-dotenv
